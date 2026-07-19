@@ -248,10 +248,10 @@ type decoder interface {
 	close()
 }
 
-// decode drives either decoder and owns where generation stops — at an EOS
-// or the NumPredict budget. Every produced token is recorded so the caches
-// never rest ahead of session.outputs; tokens past the stop are recorded but
-// not streamed or counted.
+// decode drives either decoder and owns where generation stops — at an EOS,
+// a user stop string, or the NumPredict budget. Every produced token is
+// recorded so the caches never rest ahead of session.outputs; tokens past the
+// stop are recorded but not streamed or counted.
 func (r *Runner) decode(ctx context.Context, request Request, session *cacheSession, d decoder, promptEval time.Duration) error {
 	// A sampled-but-undelivered result is still a produced token; record it.
 	defer func() {
@@ -265,6 +265,7 @@ func (r *Runner) decode(ctx context.Context, request Request, session *cacheSess
 		tokenizer:       r.Tokenizer,
 		wantLogprobs:    request.SamplerOpts.Logprobs,
 		wantTopLogprobs: request.SamplerOpts.TopLogprobs,
+		stops:           request.Options.Stop,
 	}
 
 	cachedPromptCount := len(session.inputs) - len(session.remaining)
@@ -302,30 +303,13 @@ func (r *Runner) decode(ctx context.Context, request Request, session *cacheSess
 			// Record the whole run before streaming any of it: a cancelled
 			// stream returns early and must not leave the caches ahead of
 			// session.outputs.
-			stream := len(results)
-			for i, res := range results {
-				id := res.Token.Int()
-				session.outputs = append(session.outputs, id)
-				if done {
-					continue
-				}
-				if r.Tokenizer.IsEOS(id) {
-					final.DoneReason = 0
-					done = true
-					stream = i
-					continue
-				}
-				generated++
-				if generated >= request.Options.NumPredict {
-					done = true
-					stream = i + 1
-				}
+			for _, res := range results {
+				session.outputs = append(session.outputs, res.Token.Int())
 			}
 
-			for _, res := range results[:stream] {
-				resp, ok := detok.detokenize(res)
-				if !ok {
-					continue
+			emit := func(resp CompletionResponse, ok bool) {
+				if !ok || err != nil {
+					return
 				}
 				// Two-pass structured output cancels the first pass before its final response.
 				if request.IncludeIntermediateMetrics {
@@ -340,6 +324,32 @@ func (r *Runner) decode(ctx context.Context, request Request, session *cacheSess
 					err = ctx.Err()
 					return
 				case request.Responses <- resp:
+				}
+			}
+
+			for _, res := range results {
+				if done || err != nil {
+					break
+				}
+				if r.Tokenizer.IsEOS(res.Token.Int()) {
+					final.DoneReason = 0
+					done = true
+					emit(detok.flush())
+					break
+				}
+
+				generated++
+				resp, ok, stop := detok.detokenize(res)
+				emit(resp, ok)
+				if stop {
+					final.DoneReason = 0
+					done = true
+					break
+				}
+				if generated >= request.Options.NumPredict {
+					done = true
+					emit(detok.flush())
+					break
 				}
 			}
 		})
@@ -495,15 +505,19 @@ func (t *pipelinedDecoder) close() {
 }
 
 // detokenizer serializes sampled tokens into response chunks, holding bytes
-// whose UTF-8 sequence hasn't completed yet and the logprobs that belong
-// with those bytes so Content and Logprobs stay aligned when a chunk does
-// flush.
+// whose UTF-8 sequence hasn't completed or that could be part of a stop
+// string, along with the logprobs that belong with those bytes.
 type detokenizer struct {
 	tokenizer       *tokenizer.Tokenizer
 	buf             bytes.Buffer
 	logprobs        []llm.Logprob
 	wantLogprobs    bool
 	wantTopLogprobs int
+
+	// stops are the user-supplied stop strings. When non-empty, detokenize
+	// holds back content that could be part of a stop string spanning a chunk
+	// boundary and signals when a stop is reached.
+	stops []string
 }
 
 // clampLogprobs floors logprobs at -9999, the OpenAI-compatible bound;
@@ -518,13 +532,44 @@ func clampLogprobs(logprobs []llm.Logprob) {
 	}
 }
 
-func (d *detokenizer) detokenize(res sampler.Result) (CompletionResponse, bool) {
+func (d *detokenizer) detokenize(res sampler.Result) (resp CompletionResponse, emit bool, stop bool) {
 	output := res.Token.Int()
 	d.buf.WriteString(d.tokenizer.Decode([]int32{output}))
 	logprobs := buildLogprob(res, d.wantLogprobs, d.wantTopLogprobs, d.tokenizer.Decode)
 	clampLogprobs(logprobs)
 	d.logprobs = append(d.logprobs, logprobs...)
 
+	content, stop := d.flushReady()
+	if content == "" {
+		return CompletionResponse{}, false, stop
+	}
+
+	resp = CompletionResponse{Content: content, Logprobs: d.logprobs}
+	d.logprobs = nil
+	return resp, true, stop
+}
+
+// flushReady returns the buffered prefix that is safe to emit, retaining an
+// incomplete UTF-8 sequence or a suffix that could complete a stop string.
+func (d *detokenizer) flushReady() (emit string, stop bool) {
+	valid := validUTF8PrefixLen(d.buf.Bytes())
+	if valid == 0 {
+		return "", false
+	}
+	text := string(d.buf.Bytes()[:valid])
+
+	if i, ok := findStop(text, d.stops); ok {
+		d.buf.Reset()
+		return text[:i], true
+	}
+
+	keep := partialStopSuffix(text, d.stops)
+	return string(d.buf.Next(valid - keep)), false
+}
+
+// flush emits valid content held back for a partial stop-string match that
+// never completed before EOS or the token budget.
+func (d *detokenizer) flush() (CompletionResponse, bool) {
 	content := flushValidUTF8Prefix(&d.buf)
 	if content == "" {
 		return CompletionResponse{}, false
